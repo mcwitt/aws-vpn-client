@@ -3,13 +3,16 @@
 set -e
 
 # replace with your hostname
-VPN_HOST="cvpn-endpoint-<id>.prod.clientvpn.us-east-1.amazonaws.com"
+VPN_HOST="$AWS_VPN_CLIENT_VPN_HOST"
 # path to the patched openvpn
-OVPN_BIN="./openvpn"
+OVPN_BIN=openvpn
 # path to the configuration file
-OVPN_CONF="vpn.conf"
-PORT=1194
+OVPN_CONF="$AWS_VPN_CLIENT_OVPN_CONF"
+PORT="$AWS_VPN_CLIENT_PORT"
+OVPN_SVC="$AWS_VPN_CLIENT_OVPN_SVC"
 PROTO=udp
+
+SAML_RESPONSE_FILE=/etc/openvpn/saml-response.txt
 
 wait_file() {
   local file="$1"; shift
@@ -23,9 +26,6 @@ RAND=$(openssl rand -hex 12)
 
 # resolv manually hostname to IP, as we have to keep persistent ip address
 SRV=$(dig a +short "${RAND}.${VPN_HOST}"|head -n1)
-
-# cleanup
-rm -f saml-response.txt
 
 echo "Getting SAML redirect URL from the AUTH_FAILED response (host: ${SRV}:${PORT})"
 OVPN_OUT=$($OVPN_BIN --config "${OVPN_CONF}" --verb 3 \
@@ -43,7 +43,7 @@ case "${unameOut}" in
     *)          echo "Could not determine 'open' command for this OS"; exit 1;;
 esac
 
-wait_file "saml-response.txt" 30 || {
+wait_file "$SAML_RESPONSE_FILE" 30 || {
   echo "SAML Authentication time out"
   exit 1
 }
@@ -51,13 +51,17 @@ wait_file "saml-response.txt" 30 || {
 # get SID from the reply
 VPN_SID=$(echo "$OVPN_OUT" | awk -F : '{print $7}')
 
-echo "Running OpenVPN with sudo. Enter password if requested"
+AUTH_FILE="$(dirname "$OVPN_CONF")/auth.txt"
 
-# Finally OpenVPN with a SAML response we got
-# Delete saml-response.txt after connect
-sudo bash -c "$OVPN_BIN --config "${OVPN_CONF}" \
-    --verb 3 --auth-nocache --inactive 3600 \
-    --proto "$PROTO" --remote $SRV $PORT \
-    --script-security 2 \
-    --route-up '/usr/bin/env rm saml-response.txt' \
-    --auth-user-pass <( printf \"%s\n%s\n\" \"N/A\" \"CRV1::${VPN_SID}::$(cat saml-response.txt)\" )"
+echo "Using sudo to update credentials and restart service. Enter password if requested."
+sudo \
+    VPN_SID="$VPN_SID" \
+    SAML_RESPONSE_FILE="$SAML_RESPONSE_FILE" \
+    AUTH_FILE="$AUTH_FILE" \
+    OVPN_SVC="$OVPN_SVC" \
+    /usr/bin/env bash <<'EOF'
+printf "%s\n%s\n" "N/A" "CRV1::${VPN_SID}::$(cat "$SAML_RESPONSE_FILE")" > "$AUTH_FILE"
+rm -f "$SAML_RESPONSE_FILE"
+echo "OpenVPN credentials written to ${AUTH_FILE}. Restarting ${OVPN_SVC}..."
+systemctl restart ${OVPN_SVC}
+EOF
